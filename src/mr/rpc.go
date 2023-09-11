@@ -6,8 +6,11 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+	"time"
+)
 
 //
 // example to show how to declare the arguments
@@ -24,6 +27,30 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
+type Task struct {
+	FileName  string
+	Id        int
+	StartTime time.Time
+	Status    TaskStatus
+	NReduce   int
+	NMap      int
+}
+
+// HeartbeatArgs are the arguments that a worker will send when calling the Heartbeat RPC
+type HeartbeatArgs struct{}
+
+// HeartbeatReply is what the coordinator will reply with when the Heartbeat RPC is called
+type HeartbeatReply struct {
+	Response HeartbeatResponse
+}
+
+// ReportArgs are the arguments that a worker will send when calling the Report RPC
+type ReportArgs struct {
+	Request ReportRequest
+}
+
+// ReportReply is what the coordinator will reply with when the Report RPC is called
+type ReportReply struct{}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.

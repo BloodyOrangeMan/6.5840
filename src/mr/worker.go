@@ -1,10 +1,16 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"time"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -24,47 +30,67 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+// ByKey is a type for a slice of KeyValue pairs that implements sort.Interface
+// to sort by Key.
+type ByKey []KeyValue
+
+func (a ByKey) Len() int {
+	return len(a)
+}
+
+func (a ByKey) Swap(i, j int) {
+	a[i], a[j] = a[j], a[i]
+}
+
+func (a ByKey) Less(i, j int) bool {
+	return a[i].Key < a[j].Key
+}
 
 //
 // main/mrworker.go calls this function.
 //
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+	for {
+		// Call the Heartbeat RPC to get a task from the coordinator
+		hbReply, err := CallHeartbeat()
+		if err != nil {
+			return
+		}
 
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-
+		if hbReply.Response.ShouldRun {
+			switch hbReply.Response.Phase {
+			case MapPhase:
+				handleMapTask(hbReply.Response.Task, mapf)
+			case ReducePhase:
+				handleReduceTask(hbReply.Response.Task, reducef)
+			case DonePhase:
+				return
+			}
+		}
+		time.Sleep(1 * time.Second) // Wait for some time before requesting the next task
+	}
 }
 
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+func CallHeartbeat() (HeartbeatReply, error) {
+	args := HeartbeatArgs{}
+	var reply HeartbeatReply
+	ok := call("Coordinator.Heartbeat", &args, &reply)
+	if !ok {
+		return HeartbeatReply{}, fmt.Errorf("Heartbeat call failed")
 	}
+	return reply, nil
+}
+
+func CallReport(request ReportRequest) error {
+	args := ReportArgs{
+		Request: request,
+	}
+	var reply ReportReply
+	ok := call("Coordinator.Report", &args, &reply)
+	if !ok {
+		return fmt.Errorf("Report call failed")
+	}
+	return nil
 }
 
 //
@@ -88,4 +114,96 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 
 	fmt.Println(err)
 	return false
+}
+
+func handleMapTask(task Task, mapf func(string, string) []KeyValue) {
+	input, err := ioutil.ReadFile(task.FileName)
+	if err != nil {
+		CallReport(ReportRequest{
+			TaskID:  task.Id,
+			Success: false,
+			Phase:   MapPhase,
+			Err:     err.Error(),
+		})
+		return
+	}
+
+	kva := mapf(task.FileName, string(input))
+	intermediate := make([][]KeyValue, task.NReduce)
+	for _, kv := range kva {
+		index := ihash(kv.Key) % task.NReduce
+		intermediate[index] = append(intermediate[index], kv)
+	}
+
+	for i, kvs := range intermediate {
+		ofile, _ := os.Create(reduceName(task.Id, i))
+		enc := json.NewEncoder(ofile)
+		for _, kv := range kvs {
+			err := enc.Encode(&kv)
+			if err != nil {
+				log.Printf("Failed to encode kv %v: %v", kv, err)
+			}
+		}
+		ofile.Close()
+	}
+
+	CallReport(ReportRequest{
+		TaskID:  task.Id,
+		Success: true,
+		Phase:   MapPhase,
+		Err:     "",
+	})
+}
+
+func reduceName(mapTask int, reduceTask int) string {
+	return fmt.Sprintf("mr-%d-%d", mapTask, reduceTask)
+}
+
+func handleReduceTask(task Task, reducef func(string, []string) string) {
+	var kva []KeyValue
+	for i := 0; i < task.NMap; i++ {
+		file, err := os.Open(reduceName(i, task.Id))
+		if err != nil {
+			log.Fatalf("cannot open %v", reduceName(i, task.Id))
+		}
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kva = append(kva, kv)
+		}
+		file.Close()
+	}
+
+	sort.Sort(ByKey(kva))
+
+	oname := fmt.Sprintf("mr-out-%d", task.Id)
+	ofile, _ := os.Create(oname)
+	defer ofile.Close()
+
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := reducef(kva[i].Key, values)
+
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+
+		i = j
+	}
+
+	CallReport(ReportRequest{
+		TaskID:  task.Id,
+		Success: true,
+		Phase:   ReducePhase,
+		Err:     "",
+	})
 }
